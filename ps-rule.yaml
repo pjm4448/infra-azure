@@ -1,0 +1,19 @@
+# ---------------------------------------------------------------------------
+# PSRule configuration for Azure Infrastructure as Code
+# ---------------------------------------------------------------------------
+
+configuration:
+  # Expand .bicep and .bicepparam files into ARM templates for analysis.
+  # PSRule calls the Bicep CLI to compile templates before evaluating rules.
+  AZURE_BICEP_FILE_EXPANSION: true
+  AZURE_BICEP_FILE_EXPANSION_TIMEOUT: 30
+
+input:
+  pathIgnore:
+    - '.github/**'
+    - '*.md'
+    - '.gitignore'
+
+output:
+  culture:
+    - 'en-US'
