@@ -26,7 +26,7 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
     sku: {
       name: 'PerGB2018'
     }
-    retentionInDays: 30
+    retentionInDays: 60
   }
 }
 
@@ -44,3 +44,4 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 // --- Outputs ---
 @description('The Application Insights connection string for the Function App.')
 output appInsightsConnectionString string = appInsights.properties.ConnectionString
+
