@@ -1,7 +1,8 @@
 # ---------------------------------------------------------------------------
 # Workflow: Reusable Infrastructure Deployment
 # Called by deploy-infra.yml for each environment stage.
-# Handles OIDC authentication, Bicep deployment, and RBAC stabilisation.
+# Handles OIDC authentication, Bicep deployment, RBAC stabilisation,
+# and post-deployment smoke tests.
 # ---------------------------------------------------------------------------
 
 name: Reusable Infrastructure Deployment
@@ -18,9 +19,6 @@ on:
         type: string
         description: 'Path to the .bicepparam parameter file'
 
-# Permissions must also be declared in the calling workflow.
-# The effective permissions are determined by the caller; these serve as
-# documentation of what this workflow requires.
 permissions:
   id-token: write
   contents: read
@@ -55,7 +53,6 @@ jobs:
 
       - name: Verify RBAC propagation
         run: |
-          # Map GitHub Environment name to CAF short name
           case "${{ inputs.environment }}" in
             development) ENV_SHORT="dev" ;;
             testing)     ENV_SHORT="test" ;;
@@ -100,3 +97,86 @@ jobs:
             echo "  Attempt $i/$MAX_RETRIES: found $ROLE_COUNT roles, retrying in ${RETRY_INTERVAL}s..."
             sleep $RETRY_INTERVAL
           done
+
+      - name: Post-deployment smoke tests
+        run: |
+          case "${{ inputs.environment }}" in
+            development) ENV_SHORT="dev" ;;
+            testing)     ENV_SHORT="test" ;;
+            production)  ENV_SHORT="prod" ;;
+          esac
+
+          FUNC_NAME="func-pjmcore-${ENV_SHORT}-aue-01"
+          RG_NAME="rg-pjmcore-${ENV_SHORT}-aue-01"
+          STORAGE_NAME="stpjmcore${ENV_SHORT}aue01"
+
+          echo "=============================="
+          echo "Smoke Tests: ${{ inputs.environment }}"
+          echo "=============================="
+
+          FAILURES=0
+
+          # --- Check 1: Function App state ---
+          STATE=$(az functionapp show \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "state" -o tsv)
+
+          if [ "$STATE" = "Running" ]; then
+            echo "✓ Function App state: Running"
+          else
+            echo "::error::Function App state: '$STATE' (expected 'Running')"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # --- Check 2: System-Assigned Managed Identity ---
+          PRINCIPAL_ID=$(az functionapp identity show \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "principalId" -o tsv)
+
+          if [ -n "$PRINCIPAL_ID" ] && [ "$PRINCIPAL_ID" != "None" ]; then
+            echo "✓ Managed Identity principal: $PRINCIPAL_ID"
+          else
+            echo "::error::System-Assigned Managed Identity not found"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # --- Check 3: Storage shared key access disabled ---
+          SHARED_KEY=$(az storage account show \
+            --name "$STORAGE_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "allowSharedKeyAccess" -o tsv)
+
+          if [ "$SHARED_KEY" = "false" ]; then
+            echo "✓ Shared key access: disabled"
+          else
+            echo "::error::Shared key access: '$SHARED_KEY' (expected 'false')"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # --- Check 4: Deployment package container exists ---
+          STORAGE_ID=$(az storage account show \
+            --name "$STORAGE_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "id" -o tsv)
+
+          CONTAINER=$(az resource show \
+            --ids "${STORAGE_ID}/blobServices/default/containers/deploymentpackage" \
+            --query "name" -o tsv 2>/dev/null || echo "")
+
+          if [ "$CONTAINER" = "deploymentpackage" ]; then
+            echo "✓ Deployment container: present"
+          else
+            echo "::error::Deployment container 'deploymentpackage' not found"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # --- Summary ---
+          echo ""
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::error::$FAILURES smoke test(s) failed for ${{ inputs.environment }}"
+            exit 1
+          else
+            echo "✓ All smoke tests passed for ${{ inputs.environment }}"
+          fi
