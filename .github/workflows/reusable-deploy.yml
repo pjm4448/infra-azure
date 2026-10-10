@@ -117,10 +117,29 @@ jobs:
           FAILURES=0
 
           # --- Check 1: Function App state ---
-          STATE=$(az functionapp show \
-            --name "$FUNC_NAME" \
-            --resource-group "$RG_NAME" \
-            --query "state" -o tsv)
+          # Flex Consumption apps provision asynchronously: after the ARM deployment
+          # completes, the platform still needs to pull the deployment package and
+          # start the first instance before "state" reports "Running". Retry to
+          # avoid failing on this transient cold-start window.
+          STATE_MAX_RETRIES=10
+          STATE_RETRY_INTERVAL=15
+          STATE=""
+
+          for i in $(seq 1 $STATE_MAX_RETRIES); do
+            STATE=$(az functionapp show \
+              --name "$FUNC_NAME" \
+              --resource-group "$RG_NAME" \
+              --query "state" -o tsv)
+
+            if [ "$STATE" = "Running" ]; then
+              break
+            fi
+
+            if [ "$i" -lt "$STATE_MAX_RETRIES" ]; then
+              echo "  Attempt $i/$STATE_MAX_RETRIES: Function App state '$STATE', retrying in ${STATE_RETRY_INTERVAL}s..."
+              sleep $STATE_RETRY_INTERVAL
+            fi
+          done
 
           if [ "$STATE" = "Running" ]; then
             echo "✓ Function App state: Running"
