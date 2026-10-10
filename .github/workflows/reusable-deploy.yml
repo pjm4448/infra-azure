@@ -1,0 +1,102 @@
+# ---------------------------------------------------------------------------
+# Workflow: Reusable Infrastructure Deployment
+# Called by deploy-infra.yml for each environment stage.
+# Handles OIDC authentication, Bicep deployment, and RBAC stabilisation.
+# ---------------------------------------------------------------------------
+
+name: Reusable Infrastructure Deployment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'GitHub Environment name (development, testing, production)'
+      parameterFile:
+        required: true
+        type: string
+        description: 'Path to the .bicepparam parameter file'
+
+# Permissions must also be declared in the calling workflow.
+# The effective permissions are determined by the caller; these serve as
+# documentation of what this workflow requires.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy — ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: infra-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy infrastructure
+        run: |
+          az deployment sub create \
+            --location australiaeast \
+            --template-file main.bicep \
+            --parameters ${{ inputs.parameterFile }} \
+            --name "infra-${{ inputs.environment }}-${{ github.run_id }}"
+
+      - name: Verify RBAC propagation
+        run: |
+          # Map GitHub Environment name to CAF short name
+          case "${{ inputs.environment }}" in
+            development) ENV_SHORT="dev" ;;
+            testing)     ENV_SHORT="test" ;;
+            production)  ENV_SHORT="prod" ;;
+          esac
+
+          FUNC_NAME="func-pjmcore-${ENV_SHORT}-aue-01"
+          RG_NAME="rg-pjmcore-${ENV_SHORT}-aue-01"
+          STORAGE_NAME="stpjmcore${ENV_SHORT}aue01"
+
+          PRINCIPAL_ID=$(az functionapp identity show \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --query principalId -o tsv)
+
+          STORAGE_ID=$(az storage account show \
+            --name "$STORAGE_NAME" \
+            --resource-group "$RG_NAME" \
+            --query id -o tsv)
+
+          echo "Verifying role assignments for $FUNC_NAME on $STORAGE_NAME..."
+
+          MAX_RETRIES=6
+          RETRY_INTERVAL=15
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            ROLE_COUNT=$(az role assignment list \
+              --assignee "$PRINCIPAL_ID" \
+              --scope "$STORAGE_ID" \
+              --query "length([])" -o tsv)
+
+            if [ "$ROLE_COUNT" -ge 3 ]; then
+              echo "✓ All $ROLE_COUNT role assignments verified (attempt $i/$MAX_RETRIES)"
+              exit 0
+            fi
+
+            if [ "$i" -eq "$MAX_RETRIES" ]; then
+              echo "::error::Role assignment verification timed out — found $ROLE_COUNT of 3 expected roles"
+              exit 1
+            fi
+
+            echo "  Attempt $i/$MAX_RETRIES: found $ROLE_COUNT roles, retrying in ${RETRY_INTERVAL}s..."
+            sleep $RETRY_INTERVAL
+          done

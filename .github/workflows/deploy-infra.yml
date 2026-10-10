@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Workflow: Deploy Infrastructure
+# Triggered on merge to main. Promotes infrastructure through
+# development → testing → production with an approval gate.
+# ---------------------------------------------------------------------------
+
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "main.bicep"
+      - "modules/**"
+      - "parameters/**"
+      - "bicepconfig.json"
+      - ".github/workflows/deploy-infra.yml"
+      - ".github/workflows/reusable-deploy.yml"
+
+# Top-level permissions apply to all jobs, including reusable workflow calls.
+# id-token:  OIDC authentication to Azure
+# contents:  Repository checkout
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # =========================================================================
+  # Stage 1: Development — deploys immediately on merge
+  # =========================================================================
+  deploy-dev:
+    name: Development
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: development
+      parameterFile: parameters/main.dev.bicepparam
+
+  # =========================================================================
+  # Stage 2: Testing — auto-promoted after Development succeeds
+  # =========================================================================
+  deploy-test:
+    name: Testing
+    needs: deploy-dev
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: testing
+      parameterFile: parameters/main.test.bicepparam
+
+  # =========================================================================
+  # Stage 3a: Production What-If — generates change preview before approval
+  #
+  # Uses the development environment for OIDC authentication because:
+  #   - The production environment has an approval gate that would pause this
+  #     job before the What-If runs, defeating its purpose.
+  #   - What-If is a read-only operation — no resources are created or modified.
+  #   - The Contributor role is subscription-scoped, so the development OIDC
+  #     credential can evaluate changes to any resource group.
+  # =========================================================================
+  whatif-prod:
+    name: Production — What-If
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: What-If — Production
+        run: |
+          az deployment sub what-if \
+            --location australiaeast \
+            --template-file main.bicep \
+            --parameters parameters/main.prod.bicepparam \
+            2>&1 | tee whatif-output.txt
+
+      - name: Write What-If to job summary
+        if: always()
+        run: |
+          echo "## 🔍 Production What-If" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '<details><summary>Click to expand resource changes</summary>' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat whatif-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '</details>' >> $GITHUB_STEP_SUMMARY
+
+  # =========================================================================
+  # Stage 3b: Production — approval-gated deployment
+  # =========================================================================
+  deploy-prod:
+    name: Production
+    needs: whatif-prod
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: production
+      parameterFile: parameters/main.prod.bicepparam
