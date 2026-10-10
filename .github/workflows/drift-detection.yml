@@ -1,0 +1,131 @@
+# ---------------------------------------------------------------------------
+# Workflow: Nightly Drift Detection
+# Runs az deployment sub what-if across all environments on a schedule.
+# Creates a GitHub Issue if any environment has drifted from the declared
+# Bicep configuration.
+# ---------------------------------------------------------------------------
+
+name: Drift Detection
+
+on:
+  schedule:
+    # 16:00 UTC = 02:00 AEST / 03:00 AEDT (next day)
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  detect-drift:
+    name: Detect Drift
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run What-If across all environments
+        run: |
+          DRIFT_ENVS=""
+
+          for PARAM_FILE in parameters/main.dev.bicepparam parameters/main.test.bicepparam parameters/main.prod.bicepparam; do
+            ENV=$(basename "$PARAM_FILE" | sed 's/main\.\(.*\)\.bicepparam/\1/')
+
+            echo ""
+            echo "==============================="
+            echo "What-If: $ENV"
+            echo "==============================="
+
+            az deployment sub what-if \
+              --location australiaeast \
+              --template-file main.bicep \
+              --parameters "$PARAM_FILE" \
+              2>&1 | tee "whatif-${ENV}.txt"
+
+            # Check for change indicators in the What-If summary.
+            # When no drift exists, the output contains "no change".
+            # When drift exists, it contains phrases like "to modify", "to create", "to delete".
+            if grep -qE "(to create|to modify|to delete)" "whatif-${ENV}.txt"; then
+              echo ""
+              echo "⚠️  Drift detected in $ENV"
+              DRIFT_ENVS="${DRIFT_ENVS} ${ENV}"
+            else
+              echo ""
+              echo "✓ No drift in $ENV"
+            fi
+          done
+
+          # Export for subsequent steps
+          echo "DRIFT_ENVS=${DRIFT_ENVS}" >> "$GITHUB_ENV"
+
+      - name: Create or update drift issue
+        if: env.DRIFT_ENVS != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Drift detected in:${DRIFT_ENVS}"
+
+          # --- Build issue body ---
+          {
+            echo "## 🔄 Infrastructure Drift Report"
+            echo ""
+            echo "**Detected:** $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "**Affected environments:**${DRIFT_ENVS}"
+            echo "**Workflow run:** [View details](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+            echo ""
+
+            for ENV in ${DRIFT_ENVS}; do
+              echo "### ${ENV}"
+              echo ""
+              echo "<details><summary>What-If output</summary>"
+              echo ""
+              echo '```'
+              cat "whatif-${ENV}.txt"
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            done
+
+            echo "## Recommended Actions"
+            echo ""
+            echo "1. Review the What-If output above to identify the source of drift"
+            echo "2. If drift was caused by a manual change, decide whether to incorporate it into Bicep or revert it in the Azure Portal"
+            echo "3. If drift reflects a desired change, update the Bicep templates and merge to \`main\`"
+            echo "4. Re-run the pipeline to converge the environment back to the declared state"
+            echo "5. Close this issue once drift has been resolved"
+          } > issue-body.md
+
+          # --- Check for existing open drift issue ---
+          EXISTING_ISSUE=$(gh issue list \
+            --label "infrastructure-drift" \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING_ISSUE" ]; then
+            gh issue comment "$EXISTING_ISSUE" --body-file issue-body.md
+            echo "✓ Updated existing drift issue #${EXISTING_ISSUE}"
+          else
+            gh issue create \
+              --title "Infrastructure Drift Detected — $(date -u +%Y-%m-%d)" \
+              --body-file issue-body.md \
+              --label "infrastructure-drift"
+            echo "✓ Created new drift issue"
+          fi
+
+      - name: Confirm no drift
+        if: env.DRIFT_ENVS == ''
+        run: echo "✓ All environments match declared Bicep configuration — no drift detected"
