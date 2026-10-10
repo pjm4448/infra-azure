@@ -105,3 +105,5 @@ jobs:
     with:
       environment: production
       parameterFile: parameters/main.prod.bicepparam
+    secrets:
+      APP_DISPATCH_TOKEN: ${{ secrets.APP_DISPATCH_TOKEN }}

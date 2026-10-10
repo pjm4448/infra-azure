@@ -18,6 +18,9 @@ on:
         required: true
         type: string
         description: 'Path to the .bicepparam parameter file'
+    secrets:
+      APP_DISPATCH_TOKEN:
+        required: false
 
 permissions:
   id-token: write
@@ -201,3 +204,17 @@ jobs:
           else
             echo "✓ All smoke tests passed for ${{ inputs.environment }}"
           fi
+
+      - name: Notify application pipeline
+        if: inputs.environment == 'production'
+        env:
+          GH_TOKEN: ${{ secrets.APP_DISPATCH_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/pjm4448/app-dotnet-function/dispatches" \
+            -f event_type="infrastructure-updated" \
+            -f "client_payload[environment]=production" \
+            -f "client_payload[trigger]=infra-deploy-${{ github.run_id }}"
+
+          echo "✓ Dispatched infrastructure-updated event to app-dotnet-function"
