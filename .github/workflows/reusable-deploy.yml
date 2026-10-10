@@ -117,19 +117,21 @@ jobs:
           FAILURES=0
 
           # --- Check 1: Function App state ---
-          # Flex Consumption apps provision asynchronously: after the ARM deployment
-          # completes, the platform still needs to pull the deployment package and
-          # start the first instance before "state" reports "Running". Retry to
-          # avoid failing on this transient cold-start window.
-          STATE_MAX_RETRIES=10
-          STATE_RETRY_INTERVAL=15
+          # NOTE: "state" is nested under "properties" in the `az functionapp show`
+          # JSON response (confirmed via `az functionapp show -o json`), not a
+          # top-level field, so `--query "state"` always returns empty regardless
+          # of how long we wait. The correct JMESPath is "properties.state".
+          # A short retry is kept as a safety net for the brief window right after
+          # ARM deployment completes, before the platform finishes provisioning.
+          STATE_MAX_RETRIES=5
+          STATE_RETRY_INTERVAL=10
           STATE=""
 
           for i in $(seq 1 $STATE_MAX_RETRIES); do
             STATE=$(az functionapp show \
               --name "$FUNC_NAME" \
               --resource-group "$RG_NAME" \
-              --query "state" -o tsv)
+              --query "properties.state" -o tsv)
 
             if [ "$STATE" = "Running" ]; then
               break
